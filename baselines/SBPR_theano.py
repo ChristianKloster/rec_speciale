@@ -213,7 +213,7 @@ class SBPR(object):
         sgd_users = numpy.array(list(self._train_users))[
             numpy.random.randint(len(list(self._train_users)), size=n_samples)]
         sgd_pos_items, sgd_neg_items, sgd_social_pos_items = [], [], []
-        for sgd_user in sgd_users:
+        for sgd_user in tqdm(sgd_users, desc='Generating random samples'):
             # taking positive sample
             pos_item = self._train_dict[sgd_user][numpy.random.randint(len(self._train_dict[sgd_user]))]
             sgd_pos_items.append(pos_item)
@@ -284,20 +284,61 @@ class SBPR(object):
             precision = n_rec_and_rel / k
             recall = n_rec_and_rel / n_rel
 
+            tp = 1. / numpy.log2(numpy.arange(2, k + 2))
             dcg_relevances = [1 if p in actuals else 0 for p in preds]
-            idcg_relevances = [1 for _ in actuals]
-            # filling with zeros
-            if len(actuals) < k:
-                idcg_relevances = idcg_relevances + (k - len(actuals)) * [0]
 
-            dcg = numpy.sum((numpy.power(2, dcg_relevances) - 1) / numpy.log2(numpy.arange(2, len(dcg_relevances) + 2)))
-            idcg = numpy.sum((numpy.power(2, idcg_relevances) - 1) / numpy.log2(numpy.arange(2, len(idcg_relevances) + 2)))
+            DCG = numpy.sum(dcg_relevances * tp)
+            IDCG = tp[:min(len(actuals), k)].sum()
 
-            ndcg_values.append(dcg/idcg)
+            ndcg_values.append(DCG/IDCG)
             prec_values.append(precision)
             recall_values.append(recall)
 
         return numpy.mean(ndcg_values), numpy.mean(prec_values), numpy.mean(recall_values)
+
+    def test_cold(self, test_data, k=10):
+        test_dict, test_users, test_items = self._data_to_dict(test_data)
+
+        ndcg_0 = []
+        ndcg_1 = []
+        ndcg_2 = []
+        ndcg_3 = []
+        ndcg_4 = []
+        ndcg_5 = []
+        ndcg_6 = []
+        ndcg_7 = []
+        ndcg_8 = []
+        ndcg_9 = []
+        ndcg_10 = []
+        for user in tqdm(test_dict.keys(), desc=f'Testing with k={k}'):
+            train_ratings = self._train_dict[user]
+            # not considering users with more than 10 ratings, i.e. warm users
+            if len(train_ratings) > 10: continue
+
+            actuals = test_dict[user]
+            preds = self.top_predictions(user, topn=k)
+
+            tp = 1. / numpy.log2(numpy.arange(2, k + 2))
+            dcg_relevances = [1 if p in actuals else 0 for p in preds]
+
+            DCG = numpy.sum(dcg_relevances * tp)
+            IDCG = tp[:min(len(actuals), k)].sum()
+
+            if len(train_ratings) == 10: ndcg_10.append(DCG / IDCG)
+            if len(train_ratings) == 9: ndcg_9.append(DCG / IDCG)
+            if len(train_ratings) == 8: ndcg_8.append(DCG / IDCG)
+            if len(train_ratings) == 7: ndcg_7.append(DCG / IDCG)
+            if len(train_ratings) == 6: ndcg_6.append(DCG / IDCG)
+            if len(train_ratings) == 5: ndcg_5.append(DCG / IDCG)
+            if len(train_ratings) == 4: ndcg_4.append(DCG / IDCG)
+            if len(train_ratings) == 3: ndcg_3.append(DCG / IDCG)
+            if len(train_ratings) == 2: ndcg_2.append(DCG / IDCG)
+            if len(train_ratings) == 1: ndcg_1.append(DCG / IDCG)
+            if len(train_ratings) == 0: ndcg_0.append(DCG / IDCG)
+
+        return numpy.mean(ndcg_0), numpy.mean(ndcg_1), numpy.mean(ndcg_2), numpy.mean(ndcg_3), \
+               numpy.mean(ndcg_4), numpy.mean(ndcg_5), numpy.mean(ndcg_6), numpy.mean(ndcg_7), \
+               numpy.mean(ndcg_8), numpy.mean(ndcg_9), numpy.mean(ndcg_10)
 
     def _data_to_dict(self, data):
         data_dict = defaultdict(list)
@@ -309,7 +350,7 @@ class SBPR(object):
 
     def _generate_social_dict(self, social_data):
         social_dict = defaultdict(list)
-        for user in self._train_users:
+        for user in tqdm(self._train_users, desc='Generating social data'):
             social_dict[user] = []
             friends = list(social_data.query('uid == @user')['sid'])
             if len(friends):

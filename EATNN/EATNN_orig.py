@@ -11,19 +11,11 @@ import utils
 
 tf.disable_v2_behavior()
 
-DATA_ROOT = 'data/ciao_from_them'
-
-def load_data(csv_file):
-    data = pd.read_csv(csv_file)
-    return data
-
-
-train_data = pd.read_csv('../data/ciao_explicit_preprocessed/training_data_ciao_explicit_25_75.csv')
-test_data = pd.read_csv('../data/ciao_explicit_preprocessed/testing_data_ciao_explicit_25_75.csv')
-social_data = load_data('../data/ciao_explicit_preprocessed/raw_trust_with_removed_friendships_updated_ids.csv')
-n_users = max(len(train_data['uid'].unique()), len(test_data['uid'].unique()))
-n_items = max(len(train_data['iid'].unique()), len(test_data['iid'].unique()))
-
+train_data = pd.read_csv('../data/EATNN_ciao/training_ciao_implicit_25_75.csv')
+test_data = pd.read_csv('../data/EATNN_ciao/testing_ciao_implicit_25_75.csv')
+social_data = pd.read_csv('../data/EATNN_ciao/ciao_implicit_trust.csv')
+n_users = max(train_data.uid.max() + 1, test_data.uid.max() + 1)
+n_items = max(train_data.iid.max() + 1, test_data.iid.max() + 1)
 
 def _writeline_and_time(s):
     sys.stdout.write(s)
@@ -259,24 +251,15 @@ def eval_step(testset: dict, train_r, test_r, batch_size: int):
 
     n_batches = int(n_test_users / batch_size) + 1
 
-    recall1 = []
-    recall2 = []
-    recall5 = []
-    #recall10 = []
-    #recall50 = []
-    #recall100 = []
-    precision1 = []
-    precision2 = []
-    precision5 = []
-    #precision10 = []
-    #precision50 = []
-    #precision100 = []
-    ndcg1 = []
-    ndcg2 = []
-    ndcg5 = []
-    #ndcg10 = []
-    #ndcg50 = []
-    #ndcg100 = []
+    recall10 = []
+    recall50 = []
+    recall100 = []
+    precision10 = []
+    precision50 = []
+    precision100 = []
+    ndcg10 = []
+    ndcg50 = []
+    ndcg100 = []
 
     for batch_num in range(n_batches):
         start_idx = batch_num * batch_size
@@ -307,8 +290,7 @@ def eval_step(testset: dict, train_r, test_r, batch_size: int):
         recall = []
         precision = []
         ndcg = []
-        #for k in [10, 50, 100]:
-        for k in [1, 2, 5]:
+        for k in [10, 50, 100]:
             idx_topk_items = np.argpartition(-predictions, k, 1)
             bin_predictions = np.zeros_like(predictions, dtype=bool)
             bin_predictions[np.arange(n_batch_users)[:, np.newaxis], idx_topk_items[:, :k]] = True
@@ -333,54 +315,31 @@ def eval_step(testset: dict, train_r, test_r, batch_size: int):
                              for n in test_batch.getnnz(axis=1)])
             ndcg.append(DCG / IDCG)
 
-        recall1.append(recall[0])
-        recall2.append(recall[1])
-        recall5.append(recall[2])
-        #recall10.append(recall[0])
-        #recall50.append(recall[1])
-        #recall100.append(recall[2])
-        precision1.append(precision[0])
-        precision2.append(precision[1])
-        precision5.append(precision[2])
-        #precision10.append(precision[0])
-        #precision50.append(precision[1])
-        #precision100.append(precision[2])
-        ndcg1.append(ndcg[0])
-        ndcg2.append(ndcg[1])
-        ndcg5.append(ndcg[2])
-        #ndcg10.append(ndcg[0])
-        #ndcg50.append(ndcg[1])
-        #ndcg100.append(ndcg[2])
+        recall10.append(recall[0])
+        recall50.append(recall[1])
+        recall100.append(recall[2])
+        precision10.append(precision[0])
+        precision50.append(precision[1])
+        precision100.append(precision[2])
+        ndcg10.append(ndcg[0])
+        ndcg50.append(ndcg[1])
+        ndcg100.append(ndcg[2])
 
-    recall1 = np.mean(np.hstack(recall1))
-    recall2 = np.mean(np.hstack(recall2))
-    recall5 = np.mean(np.hstack(recall5))
-    #recall10 = np.mean(np.hstack(recall10))
-    #recall50 = np.mean(np.hstack(recall50))
-    #recall100 = np.mean(np.hstack(recall100))
-    precision1 = np.mean(np.hstack(precision1))
-    precision2 = np.mean(np.hstack(precision2))
-    precision5 = np.mean(np.hstack(precision5))
-    #precision10 = np.mean(np.hstack(precision10))
-    #precision50 = np.mean(np.hstack(precision50))
-    #precision100 = np.mean(np.hstack(precision100))
-    ndcg1 = np.mean(np.hstack(ndcg1))
-    ndcg2 = np.mean(np.hstack(ndcg2))
-    ndcg5 = np.mean(np.hstack(ndcg5))
-    #ndcg10 = np.mean(np.hstack(ndcg10))
-    #ndcg50 = np.mean(np.hstack(ndcg50))
-    #ndcg100 = np.mean(np.hstack(ndcg100))
+    recall10 = np.mean(np.hstack(recall10))
+    recall50 = np.mean(np.hstack(recall50))
+    recall100 = np.mean(np.hstack(recall100))
+    precision10 = np.mean(np.hstack(precision10))
+    precision50 = np.mean(np.hstack(precision50))
+    precision100 = np.mean(np.hstack(precision100))
+    ndcg10 = np.mean(np.hstack(ndcg10))
+    ndcg50 = np.mean(np.hstack(ndcg50))
+    ndcg100 = np.mean(np.hstack(ndcg100))
 
-    #print_metrics([ndcg10, ndcg50, ndcg100], [precision10, precision50, precision100], [recall10, recall50, recall100])
-    print_metrics([ndcg1, ndcg2, ndcg5], [precision1, precision2, precision5], [recall1, recall2, recall5])
-    #print(f'g0:{np.mean(np.hstack(n0dcg10))}, g1:{np.mean(np.hstack(n1dcg10))}, g2:{np.mean(np.hstack(n2dcg10))}'
-    #      f'g3:{np.mean(np.hstack(n3dcg10))}, g4:{np.mean(np.hstack(n4dcg10))}, g5:{np.mean(np.hstack(n5dcg10))}'
-    #      f'g6:{np.mean(np.hstack(n6dcg10))}, g7:{np.mean(np.hstack(n7dcg10))}, g8:{np.mean(np.hstack(n8dcg10))}'
-    #      f'g9:{np.mean(np.hstack(n9dcg10))}, g10:{np.mean(np.hstack(n10dcg10))}')
+    print_metrics([ndcg10, ndcg50, ndcg100], [precision10, precision50, precision100], [recall10, recall50, recall100])
 
 
 def print_metrics(ndcgs, precisions, recalls):
-    ks = [1, 2, 5] #10, 50, 100
+    ks = [10, 50, 100]
     for i, k in enumerate(ks):
         print(f'NDCG@{k}: {ndcgs[i]} \t Precision@{k}: {precisions[i]} \t Recall@{k}: {recalls[i]}')
 

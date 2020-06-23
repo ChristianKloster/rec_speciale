@@ -94,7 +94,7 @@ def train_test_split(data: pd.DataFrame, test_size: float = 0.75):
     test = pd.DataFrame(columns=['uid', 'iid', 'rating'])
     for uid in unique_uids:
         # shuffled user data
-        user_data = data[data['uid'] == uid].sample(frac=1, random_state=2100)
+        user_data = data[data['uid'] == uid].sample(frac=1, random_state=2020)
         # computing how many interactions to use as test
         num_interactions = len(user_data)
         test_interactions = round(num_interactions * test_size)

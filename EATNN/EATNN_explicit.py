@@ -2,7 +2,6 @@ import os
 import pickle
 import sys
 import time
-import LRMF2
 
 from LRMF import LRMF
 import pandas as pd
@@ -19,17 +18,17 @@ def load_data(csv_file):
     data = pd.read_csv(csv_file)
     return data
 
-train_data = pd.read_csv('../data/eachmovie/training_updated_each_movie_25_75.csv')
-test_data = pd.read_csv('../data/eachmovie/testing_updated_each_movie_25_75.csv')
-#køres igen!!!!!! med rigtig social data
-social_data = load_data('../data/eachmovie/socials_updated_ids.csv')
-num_users = max(len(train_data['uid'].unique()), len(test_data['uid'].unique()))
-num_items = max(len(train_data['iid'].unique()), len(test_data['iid'].unique()))
 
+train_data = pd.read_csv('../data/ciao-explicit/training_data_ciao_explicit_25_75.csv')
+test_data = pd.read_csv('../data/ciao-explicit/testing_data_ciao_explicit_25_75.csv')
+social_data = pd.read_csv('../data/ciao-explicit/raw_trust_with_removed_friendships_updated_ids.csv')
+num_users = max(len(train_data.uid.unique()), len(test_data.uid.unique()))
+num_items = max(len(train_data.iid.unique()), len(test_data.iid.unique()))
 
-with open('../data/eachmovie/best_each_movie_model_25_75.pkl', 'rb') as f:
-    lrmf:LRMF = pickle.load(f)
-    tree = lrmf.tree
+with open('../LRMF/models/LRMF_best_model_normal_cold_start_ciao_exp_consumption.pkl', 'rb') as f:
+    lrmf: LRMF = pickle.load(f)
+tree = lrmf.tree
+
 
 def writeline_and_time(s):
     sys.stdout.write(s)
@@ -293,7 +292,7 @@ class EATNN:
                     tf.einsum('ab,ac->abc', self.V, self.V), 0) *
                 tf.reduce_sum(tf.einsum('ab,ac->abc', self.P_qu, self.P_qu), 0) *
                 tf.matmul(self.H_q, self.H_q, transpose_b=True), 0), 0)
-        self.loss_item += tf.reduce_sum((1.0 - self.weight_q) * tf.square(self.pos_q) - 2.0 * self.pos_q)
+        self.loss_question += tf.reduce_sum((1.0 - self.weight_q) * tf.square(self.pos_q) - 2.0 * self.pos_q)
 
         # adding l2 regularization on social, item and questionnaire attentive user embeddings
         self.l2_loss = tf.nn.l2_loss(self.P_iu + self.P_su + self.P_qu)
@@ -415,7 +414,7 @@ def eval_step(testset: dict, train_r, test_r, batch_size: int):
             bin_predictions[np.arange(n_batch_users)[:, np.newaxis], idx_topk_items[:, :k]] = True
 
             bin_true = np.zeros_like(predictions, dtype=bool)
-            bin_true[(test_r[u_b] >= 4).nonzero()] = True
+            bin_true[test_r[u_b].nonzero()] = True
 
             recommended_and_relevant = (np.logical_and(bin_true, bin_predictions).sum(axis=1)).astype(np.float32)
             n_rel = bin_true.sum(axis=1)
@@ -549,7 +548,7 @@ def preprocess_data(u_train, u_test, r_train, r_test, i_train, i_test, u_friend,
 
 
 if __name__ == '__main__':
-    random_seed = 2050
+    random_seed = 2020
 
     u_train = np.array(train_data['uid'], dtype=np.int32)
     u_test = np.array(test_data['uid'], dtype=np.int32)
@@ -581,6 +580,7 @@ if __name__ == '__main__':
 
             optimizer = tf.train.AdamOptimizer().minimize(model.loss)
             train_op = optimizer
+
             sess.run(tf.global_variables_initializer())
 
             user_train, item_train, rating_train, friend_train, question_train = get_train_instances(train_set, train_r_set,
@@ -614,6 +614,9 @@ if __name__ == '__main__':
                 print('\r\tUpdating: time=%.2f'
                       % (time.time() - start_t))
 
-
-                print(f'Epoch loss: {loss}')
-                eval_step(test_set, train_r, test_r, batch_size)
+                if epoch < 50:
+                    if epoch % 5 == 0:
+                        print(f'Epoch loss: {loss}')
+                        eval_step(test_set, train_r, test_r, batch_size)
+                if epoch >= 50:
+                    eval_step(test_set, train_r, test_r, batch_size)

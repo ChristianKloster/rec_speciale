@@ -1,4 +1,5 @@
 import os
+import pickle
 import sys
 import time
 
@@ -8,6 +9,7 @@ import tensorflow.compat.v1 as tf
 import numpy as np
 
 import utils
+from LRMF import LRMF
 
 tf.disable_v2_behavior()
 
@@ -15,11 +17,15 @@ def load_data(csv_file):
     data = pd.read_csv(csv_file)
     return data
 
-test_data = pd.read_csv('../data/eachmovie/testing_updated_each_movie_25_75.csv')
-train_data = pd.read_csv('../data/eachmovie/training_updated_each_movie_25_75.csv')
-social_data = load_data('../data/eachmovie/socials_updated_ids.csv')
-n_users = max(len(train_data['uid'].unique()), len(test_data['uid'].unique()))
-n_items = max(len(train_data['iid'].unique()), len(test_data['iid'].unique()))
+train_data = pd.read_csv('../data/ciao-explicit/training_data_ciao_explicit_25_75.csv')
+test_data = pd.read_csv('../data/ciao-explicit/testing_data_ciao_explicit_25_75.csv')
+social_data = pd.read_csv('../data/ciao-explicit/raw_trust_with_removed_friendships_updated_ids.csv')
+n_users = max(len(train_data.uid.unique()), len(test_data.uid.unique()))
+n_items = max(len(train_data.iid.unique()), len(test_data.iid.unique()))
+
+with open('../LRMF/models/LRMF_best_model_normal_cold_start_ciao_exp_consumption.pkl', 'rb') as f:
+    lrmf: LRMF = pickle.load(f)
+tree = lrmf.tree
 
 
 def _writeline_and_time(s):
@@ -486,4 +492,8 @@ if __name__ == '__main__':
                       % (time.time() - start_t))
 
                 print(f'Epoch loss: {loss}')
-                eval_step(test_set, train_r, test_r, batch_size)
+                if epoch < 50:
+                    if epoch % 5 == 0:
+                        eval_step(test_set, train_r, test_r, batch_size)
+                if epoch >= 50:
+                    eval_step(test_set, train_r, test_r, batch_size)

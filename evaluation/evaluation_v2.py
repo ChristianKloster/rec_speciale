@@ -1,9 +1,7 @@
 from operator import itemgetter
 from typing import List, Tuple
 
-import sklearn as skl
 import numpy as np
-import utils
 
 
 class Metrics2():
@@ -118,14 +116,14 @@ class Metrics2():
         """
         n_rated = len([act for (_, act) in ratings if act > 0])
         # Number of relevant items
-        n_rel = sum((act >= avg_rating) for (_, act) in ratings)
+        n_rel = sum((act >= 4) for (_, act) in ratings)
         # Number of relevant items which are recommended
-        n_rel_and_rec = sum((act >= avg_rating) for (_, act) in ratings[:k])
+        n_rel_and_rec = sum((act >= 4) for (_, act) in ratings[:k])
 
         # Fraction of recommended items that are relevant
         precision = n_rel_and_rec / k
         # Fraction of relevant items that are recommended
-        recall = n_rel_and_rec / n_rel
+        recall = n_rel_and_rec / n_rel if n_rel > 0 else 1
 
         return precision, recall
 

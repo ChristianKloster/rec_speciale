@@ -20,23 +20,24 @@ import time
 import sys
 import os
 from tqdm import tqdm
+from LRMF import Tree
 
 os.environ['THEANO_FLAGS'] = 'device=gpu'
 from collections import defaultdict
 
 
-class BPR(object):
-    def __init__(self, rank, n_users, n_items, lambda_u=0.0025, lambda_i=0.0025, lambda_j=0.00025, lambda_bias=0.0,
+class QSBPR(object):
+    def __init__(self, rank, n_users, n_items, lambda_u=0.015, lambda_v=0.025, lambda_b=0.01,
                  learning_rate=0.05):
         '''
           Creates a new object for training and testing a Bayesian
-          Personalised Ranking (BPR) Matrix Factorisation 
+          Personalised Ranking (BPR) Matrix Factorisation
           model, as described by Rendle et al. in:
 
             http://arxiv.org/abs/1205.2618
 
           This model tries to predict a ranking of items for each user
-          from a viewing history.  
+          from a viewing history.
           It's also used in a variety of other use-cases, such
           as matrix completion, link prediction and tag recommendation.
 
@@ -66,16 +67,17 @@ class BPR(object):
           training:
 
           >>> from baselines import BPR
-          >>> bpr = BPR(10, 100, 50)
+          >>> qsbpr = QSBPR(10, 100, 50)
           >>> from numpy.random import randint
           >>> train_data = zip(randint(100, size=1000), randint(50, size=1000))
-          >>> bpr.train(train_data)
+          >>> social_data = zip(randint(100, size=1000), randint(50, size=1000))
+          >>> qsbpr.train(train_data, social_data, tree)
 
           This object also has a method for testing, which will return
           the Area Under Curve for a test set.
 
           >>> test_data = zip(randint(100, size=1000), randint(50, size=1000))
-          >>> bpr.test(test_data)
+          >>> qsbpr.test(test_data)
 
           (This should give an AUC of around 0.5 as the training and
           testing set are chosen at random)
@@ -84,9 +86,8 @@ class BPR(object):
         self._n_users = n_users
         self._n_items = n_items
         self._lambda_u = lambda_u
-        self._lambda_i = lambda_i
-        self._lambda_j = lambda_j
-        self._lambda_bias = lambda_bias
+        self._lambda_v = lambda_v
+        self._lambda_bias = lambda_b
         self._learning_rate = learning_rate
         self._train_users = set()
         self._train_items = set()
@@ -97,7 +98,7 @@ class BPR(object):
     def _configure_theano(self):
         """
           Configures Theano to run in fast mode
-          and using 32-bit floats. 
+          and using 32-bit floats.
         """
         theano.config.mode = 'FAST_RUN'
         theano.config.floatX = 'float32'
@@ -114,14 +115,19 @@ class BPR(object):
 
           where U is the user-item matrix, W is a user-factor
           matrix and H is an item-factor matrix, so that
-          it maximises the difference between
-          W[u,:].H[i,:]^T and W[u,:].H[j,:]^T, 
-          where `i` is a positive item
-          (one the user `u` has watched) and `j` a negative item
-          (one the user `u` hasn't watched).
+          it maximises the differences between
+          W[u,:].H[i,:]^T and W[u,:].H[q,:]^T and
+          W[u,:].H[q,:]^T and W[u,:].H[k,:]^T and
+          W[u,:].H[k,:]^T and W[u,:].H[j,:]^T
+          where `i` is a positive item (one the user `u` has watched),
+          `q` is a question (one the user `u` has been asked),
+          `k` is a social positive item (one the friends of `u` has watched) and
+          `j` is a negative item (one the user `u` and friends of `u` hasn't watched).
         """
         u = T.lvector('u')
         i = T.lvector('i')
+        q = T.lvector('q')
+        k = T.lvector('k')
         j = T.lvector('j')
 
         self.W = theano.shared(numpy.random.random((self._n_users, self._rank)).astype('float32'), name='W')
@@ -129,85 +135,116 @@ class BPR(object):
 
         self.B = theano.shared(numpy.zeros(self._n_items).astype('float32'), name='B')
 
-        x_ui = T.dot(self.W[u], self.H[i].T).diagonal()
-        x_uj = T.dot(self.W[u], self.H[j].T).diagonal()
+        x_ui = T.dot(self.W[u], self.H[i].T).diagonal() + self.B[i]
+        x_uq = T.dot(self.W[u], self.H[q].T).diagonal() + self.B[q]
+        x_uk = T.dot(self.W[u], self.H[k].T).diagonal() + self.B[k]
+        x_uj = T.dot(self.W[u], self.H[j].T).diagonal() + self.B[j]
 
-        x_uij = self.B[i] - self.B[j] + x_ui - x_uj
-
-        obj = T.sum(T.log(T.nnet.sigmoid(x_uij)) - self._lambda_u * (self.W[u] ** 2).sum(axis=1) - self._lambda_i * (
-                    self.H[i] ** 2).sum(axis=1) - self._lambda_j * (self.H[j] ** 2).sum(axis=1) - self._lambda_bias * (
-                                self.B[i] ** 2 + self.B[j] ** 2))
-        cost = - obj
+        obj = T.sum(T.log(T.nnet.sigmoid(x_ui - x_uq)) +
+                    T.log(T.nnet.sigmoid(x_uq - x_uk)) +
+                    T.log(T.nnet.sigmoid(x_uk - x_uj)) -
+                    self._lambda_u * (self.W[u] ** 2).sum(axis=1) -  # user regularization
+                    self._lambda_v * (self.H[i] ** 2 + self.H[q] ** 2 + self.H[k] ** 2 + self.H[j] ** 2).sum(axis=1) - # item regularization
+                    self._lambda_bias * (self.B[i] ** 2 + self.B[q] ** 2 + self.B[k] ** 2 + self.B[j] ** 2))  # bias regularization
+        cost = -obj
 
         g_cost_W = T.grad(cost=cost, wrt=self.W)
         g_cost_H = T.grad(cost=cost, wrt=self.H)
         g_cost_B = T.grad(cost=cost, wrt=self.B)
 
-        updates = [(self.W, self.W - self._learning_rate * g_cost_W), (self.H, self.H - self._learning_rate * g_cost_H),
+        updates = [(self.W, self.W - self._learning_rate * g_cost_W),
+                   (self.H, self.H - self._learning_rate * g_cost_H),
                    (self.B, self.B - self._learning_rate * g_cost_B)]
 
-        self.train_model = theano.function(inputs=[u, i, j], outputs=cost, updates=updates)
+        self.train_model = theano.function(inputs=[u, i, q, k, j], outputs=cost, updates=updates)
 
-    def train(self, train_data, epochs=100, batch_size=512):
+    def train(self, train_data, social_data, tree: Tree, epochs=100, batch_size = 256):
         """
-          Trains the BPR Matrix Factorisation model using Stochastic
-          Gradient Descent and minibatches over `train_data`.
+          Trains the QSBPR Matrix Factorisation model using Mini-batch
+          Gradient Descent over `train_data`.
 
           `train_data` is an array of (user_index, item_index) tuples.
+          `social_data` is an array of (user_index, friend_index) tuples.
 
-          We first create a set of random samples from `train_data` for 
+          We first create a set of random samples from `train_data` for
           training, of size `epochs` * size of `train_data`.
 
-          We then iterate through the resulting training samples by
-          batches of length `batch_size`, and run one iteration of gradient
-          descent for the batch.
+          We then iterate through the resulting training samples 1-by-1
+          and run one iteration of gradient descent for the sample.
         """
-        if len(train_data) < batch_size:
-            sys.stderr.write(
-                "WARNING: Batch size is greater than number of training samples, switching to a batch size of %s\n" % str(
-                    len(train_data)))
-            batch_size = len(train_data)
         self._train_dict, self._train_users, self._train_items = self._data_to_dict(train_data)
+        self._social_dict = self._generate_social_dict(social_data)
+        self._questions_dict = self._generate_question_dict(tree, train_data)
         n_sgd_samples = len(train_data) * epochs
-        sgd_users, sgd_pos_items, sgd_neg_items = self._uniform_user_sampling(n_sgd_samples)
-        z = 0
-        t2 = t1 = t0 = time.time()
-        while (z + 1) * batch_size < n_sgd_samples:
-            self.train_model(
-                sgd_users[z * batch_size: (z + 1) * batch_size],
-                sgd_pos_items[z * batch_size: (z + 1) * batch_size],
-                sgd_neg_items[z * batch_size: (z + 1) * batch_size]
-            )
-            z += 1
-            t2 = time.time()
-            sys.stderr.write("\rProcessed %s ( %.2f%% ) in %.4f seconds" % (
-            str(z * batch_size), 100.0 * float(z * batch_size) / n_sgd_samples, t2 - t1))
-            sys.stderr.flush()
-            t1 = t2
-        if n_sgd_samples > 0:
-            sys.stderr.write(
-                "\nTotal training time %.2f seconds; %e per sample\n" % (t2 - t0, (t2 - t0) / n_sgd_samples))
-            sys.stderr.flush()
+        sgd_users, sgd_pos_items, sgd_neg_items, sgd_social_pos_items, sgd_questions = self._uniform_user_sampling(n_sgd_samples)
+        # number of iterations
+        for epoch in tqdm(range(epochs), desc='Training'):
+            # iterating over batches
+            for sample in range(len(train_data)):
+                start_idx = epoch * batch_size
+                end_idx = (epoch + 1) * batch_size
+                user = sgd_users[start_idx : end_idx]
+                pos_item = sgd_pos_items[start_idx : end_idx]
+                social_pos_item = sgd_social_pos_items[start_idx : end_idx]
+                neg_item = sgd_neg_items[start_idx : end_idx]
+                question = sgd_questions[start_idx : end_idx]
+
+                self.train_model(user, pos_item, question, social_pos_item, neg_item)
 
     def _uniform_user_sampling(self, n_samples):
         """
           Creates `n_samples` random samples from training data for performing Stochastic
-          Gradient Descent. We start by uniformly sampling users, 
-          and then sample a positive and a negative item for each 
-          user sample.
+          Gradient Descent. We start by uniformly sampling users, and then sample a positive, social positive
+          and a negative item for each user sample.
         """
         sys.stderr.write("Generating %s random training samples\n" % str(n_samples))
         sgd_users = numpy.array(list(self._train_users))[
             numpy.random.randint(len(list(self._train_users)), size=n_samples)]
-        sgd_pos_items, sgd_neg_items = [], []
-        for sgd_user in sgd_users:
+        sgd_pos_items, sgd_neg_items, sgd_social_pos_items, sgd_questions = [], [], [], []
+        for sgd_user in tqdm(sgd_users, desc='Generating random samples'):
+            # taking positive sample
             pos_item = self._train_dict[sgd_user][numpy.random.randint(len(self._train_dict[sgd_user]))]
             sgd_pos_items.append(pos_item)
+            # taking social positive sample
+            if self._social_dict[sgd_user]:
+                social_pos_item = self._social_dict[sgd_user][numpy.random.randint(len(self._social_dict[sgd_user]))]
+            else:
+                social_pos_item = -1
+            sgd_social_pos_items.append(social_pos_item)
+            # taking negative sample
             neg_item = numpy.random.randint(self._n_items)
-            while neg_item in self._train_dict[sgd_user]:
+            # ... which cannot be a positive sample or social sample
+            while neg_item in self._train_dict[sgd_user] or neg_item in self._social_dict[sgd_user]:
                 neg_item = numpy.random.randint(self._n_items)
             sgd_neg_items.append(neg_item)
-        return sgd_users, sgd_pos_items, sgd_neg_items
+            # taking question sample
+            question = self._questions_dict[sgd_user][numpy.random.randint(len(self._questions_dict[sgd_user]))]
+            sgd_questions.append(question)
+
+        return sgd_users, sgd_pos_items, sgd_neg_items, sgd_social_pos_items, sgd_questions
+
+    def _generate_question_dict(self, tree: Tree, traindata):
+        questions_dict = defaultdict(list)
+        for user in tqdm(self._train_users, desc='Generating question samples'):
+            questions = self._traverse(tree, user, traindata)
+            questions_dict[user] = questions
+        return questions_dict
+
+    def _traverse(self, tree: Tree, user, traindata):
+        if tree.is_leaf() and tree.child is None:
+            return tree.global_questions + tree.local_questions
+
+        question = tree.question
+        if (user, question) in set(traindata):
+            if tree.like is not None:
+                return self._traverse(tree.like, user, traindata)
+            else:
+                return self._traverse(tree.child, user, traindata)
+        else:
+            if tree.dislike is not None:
+                return self._traverse(tree.dislike, user, traindata)
+            else:
+                return self._traverse(tree.child, user, traindata)
 
     def predictions(self, user_index):
         """
@@ -267,7 +304,7 @@ class BPR(object):
             DCG = numpy.sum(dcg_relevances * tp)
             IDCG = tp[:min(len(actuals), k)].sum()
 
-            ndcg_values.append(DCG/IDCG)
+            ndcg_values.append(DCG / IDCG)
             prec_values.append(precision)
             recall_values.append(recall)
 
@@ -301,17 +338,17 @@ class BPR(object):
             DCG = numpy.sum(dcg_relevances * tp)
             IDCG = tp[:min(len(actuals), k)].sum()
 
-            if len(train_ratings) == 10: ndcg_10.append(DCG/IDCG)
-            if len(train_ratings) == 9: ndcg_9.append(DCG/IDCG)
-            if len(train_ratings) == 8: ndcg_8.append(DCG/IDCG)
-            if len(train_ratings) == 7: ndcg_7.append(DCG/IDCG)
-            if len(train_ratings) == 6: ndcg_6.append(DCG/IDCG)
-            if len(train_ratings) == 5: ndcg_5.append(DCG/IDCG)
-            if len(train_ratings) == 4: ndcg_4.append(DCG/IDCG)
-            if len(train_ratings) == 3: ndcg_3.append(DCG/IDCG)
-            if len(train_ratings) == 2: ndcg_2.append(DCG/IDCG)
-            if len(train_ratings) == 1: ndcg_1.append(DCG/IDCG)
-            if len(train_ratings) == 0: ndcg_0.append(DCG/IDCG)
+            if len(train_ratings) == 10: ndcg_10.append(DCG / IDCG)
+            if len(train_ratings) == 9: ndcg_9.append(DCG / IDCG)
+            if len(train_ratings) == 8: ndcg_8.append(DCG / IDCG)
+            if len(train_ratings) == 7: ndcg_7.append(DCG / IDCG)
+            if len(train_ratings) == 6: ndcg_6.append(DCG / IDCG)
+            if len(train_ratings) == 5: ndcg_5.append(DCG / IDCG)
+            if len(train_ratings) == 4: ndcg_4.append(DCG / IDCG)
+            if len(train_ratings) == 3: ndcg_3.append(DCG / IDCG)
+            if len(train_ratings) == 2: ndcg_2.append(DCG / IDCG)
+            if len(train_ratings) == 1: ndcg_1.append(DCG / IDCG)
+            if len(train_ratings) == 0: ndcg_0.append(DCG / IDCG)
 
         return numpy.mean(ndcg_0), numpy.mean(ndcg_1), numpy.mean(ndcg_2), numpy.mean(ndcg_3), \
                numpy.mean(ndcg_4), numpy.mean(ndcg_5), numpy.mean(ndcg_6), numpy.mean(ndcg_7), \
@@ -324,3 +361,23 @@ class BPR(object):
             data_dict[user].append(item)
             items.add(item)
         return data_dict, set(data_dict.keys()), items
+
+    def _generate_social_dict(self, social_data):
+        social_dict = defaultdict(list)
+        for user in tqdm(self._train_users, desc='Generating social data'):
+            social_dict[user] = []
+            friends = list(social_data.query('uid == @user')['sid'])
+            if len(friends):
+                social_pos_items = []
+                # finding friends' rated items
+                for friend in friends:
+                    social_pos_items += self._train_dict[friend]
+                # removing items user has rated himself
+                pos_items = self._train_dict[user]
+                social_pos_items = list(set(social_pos_items) - set(pos_items))
+                # checking if friends have rated minimum 1 item the user hasn't himself
+                if len(social_pos_items):
+                    social_dict[user] = social_pos_items
+        return social_dict
+
+
