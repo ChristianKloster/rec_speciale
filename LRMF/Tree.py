@@ -2,11 +2,12 @@ from collections import defaultdict
 import numpy as np
 
 class Node(object):
-    def __init__(self, users, question, like=None, dislike=None):
+    def __init__(self, users, question, like=None, dislike=None, child=None):
         self.users = users                      # Set of users
         self.question = question                # item id used for question
         self.like = like                        # Like child
         self.dislike = dislike                  # Dislike child
+        self.child = child                      # If no split can be performed
 
     def is_leaf(self):
         if self.like is None and self.dislike is None and self.child is None:
@@ -46,29 +47,10 @@ def traverse_a_user(user: int, data, tree: Node):
     if tree.is_leaf():
         return tree
 
-    if tree.child is None:
-        if data[user, tree.raw_question] >= 1:
+    if tree.child == None:
+        if data[user, tree.question] >= 1:
             return traverse_a_user(user, data, tree.like)
         else:
             return traverse_a_user(user, data, tree.dislike)
     else:
         return traverse_a_user(user, data, tree.child)
-
-
-def find_user_group(user, tree: Node):
-    if tree.is_leaf():
-        return tree
-
-    elif user in tree.like.users:
-        return find_user_group(user, tree.like)
-
-    else:
-        return find_user_group(user, tree.dislike)
-
-
-def number_of_leaves(root: Node):
-    if root.is_leaf():
-        return 1
-    return number_of_leaves(root.like) + number_of_leaves(root.dislike)
-
-

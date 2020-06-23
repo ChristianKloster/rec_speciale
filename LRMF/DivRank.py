@@ -2,6 +2,7 @@ import collections
 import math
 import scipy.sparse
 import numpy as np
+from tqdm import tqdm
 import networkx as nx
 from networkx.exception import NetworkXError
 from networkx.utils import not_implemented_for
@@ -10,7 +11,7 @@ from networkx.utils import not_implemented_for
 
 @not_implemented_for('multigraph')
 def divrank(G, alpha=0.25, d=0.85, personalization=None,
-            max_iter=100, tol=1.0e-6, nstart=None, weight='weight',
+            max_iter=500, tol=1.0e-6, nstart=None, weight='weight',
             dangling=None):
     '''
     Returns the DivRank (Diverse Rank) of the nodes in the graph.

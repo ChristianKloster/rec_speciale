@@ -3,6 +3,7 @@ import pickle
 import sys
 import time
 
+from LRMF import *
 import pandas as pd
 import scipy.sparse
 import tensorflow.compat.v1 as tf
@@ -10,27 +11,30 @@ import numpy as np
 
 import Tree
 import utils
-from LRMF import LRMF
 
 tf.disable_v2_behavior()
 
 DATA_ROOT = 'data/ciao_from_them'
 
-
 def load_data(csv_file):
     data = pd.read_csv(csv_file)
     return data
 
-train_data = pd.read_csv('../data/eachmovie/training_updated_each_movie_25_75.csv')
-test_data = pd.read_csv('../data/eachmovie/testing_updated_each_movie_25_75.csv')
-social_data = pd.read_csv('../data/eachmovie/socials.csv')
-num_users = max(len(train_data.uid.unique()), len(test_data.uid.unique()))
-num_items = max(len(train_data.iid.unique()), len(test_data.iid.unique()))
+#train_data = pd.read_csv('../LRMF/LRMF_data/ciao_explicit/training_data_ciao_explicit_25_75.csv')
+#test_data = pd.read_csv('../LRMF/LRMF_data/ciao_explicit/testing_data_ciao_explicit_25_75.csv')
+#social_data = pd.read_csv('../LRMF/LRMF_data/ciao_explicit/raw_trust_with_removed_friendships_updated_ids.csv')
 
-with open('../LRMF/models/best_each_movie_model_25_75.pkl', 'rb') as f:
-    lrmf: LRMF = pickle.load(f)
+train_data = pd.read_csv('../LRMF/LRMF_data/ciao_explicit/exp_ciao_extreme_train_70_30.csv')
+test_data = pd.read_csv('../LRMF/LRMF_data/ciao_explicit/exp_ciao_extreme_test_70_30.csv')
+social_data = pd.read_csv('../LRMF/LRMF_data/ciao_explicit/raw_trust_with_removed_friendships_updated_ids.csv')
+
+n_users = max(train_data.uid.max(), test_data.uid.max()) + 1
+n_items = max(train_data.iid.max(), test_data.iid.max()) + 1
+
+#with open('../LRMF/LRMF_models/ciao_explicit/LRMF_best_model_normal_cold_start_ciao_exp_consumption.pkl', 'rb') as f:
+with open('../LRMF/models/exp_ciao_70_30_best_model.pkl', 'rb') as f:
+    lrmf = pickle.load(f)
 tree = lrmf.tree
-
 
 def writeline_and_time(s):
     sys.stdout.write(s)
@@ -251,7 +255,7 @@ class EATNN:
         # Questionnaire embeddings lookup
         self.pos_questions = tf.nn.embedding_lookup(self.V, self.input_uq)
         # Answered questions for this inference
-        self.pos_n_questions = tf.cast(tf.not_equal(self.input_uq, self.n_items), 'float32')
+        self.pos_n_questions = tf.cast(tf.not_equal(self.input_uq, self.n_items), 'float32') # consider if this should numbers of questions instead?
         # Obtaining embeddings for questions used in this inference
         self.pos_questions = tf.einsum('ab,abc->abc', self.pos_n_questions, self.pos_questions)
         # Multiplying with question attentive transferred user embeddings
@@ -478,14 +482,14 @@ def preprocess_data(u_train, u_test, i_train, i_test, u_friend, v_friend):
     max_questions = 0
     for u in np.unique(u_train):
         leaf = Tree.traverse_a_user(u, train_r, tree)
-        train_q_set[u] = leaf.raw_globals + leaf.raw_locals
+        train_q_set[u] = leaf.global_questions + leaf.local_questions
     # making sure all inputs are of same size
     for u in train_q_set.keys():
         if len(train_q_set[u]) > max_questions:
             max_questions = len(train_q_set[u])
     for u in train_q_set.keys():
         while len(train_q_set[u]) < max_questions:
-            train_q_set[u].append(num_items)
+            train_q_set[u].append(n_items)
 
     # Building training set for interactions
     train_set = {}
@@ -505,7 +509,7 @@ def preprocess_data(u_train, u_test, i_train, i_test, u_friend, v_friend):
             max_items = len(train_set[u])
     for u in train_set.keys():
         while len(train_set[u]) < max_items:
-            train_set[u].append(num_items)
+            train_set[u].append(n_items)
 
     # Building training set for social domain
     train_f_set = {}
@@ -520,9 +524,9 @@ def preprocess_data(u_train, u_test, i_train, i_test, u_friend, v_friend):
             max_friends = len(train_f_set[i])
     for i in train_set.keys():
         if not i in train_f_set:
-            train_f_set[i] = [num_users]
+            train_f_set[i] = [n_users]
         while len(train_f_set[i]) < max_friends:
-            train_f_set[i].append(num_users)
+            train_f_set[i].append(n_users)
 
     return test_set, train_set, train_f_set, train_q_set, max_questions, max_items, max_friends
 
@@ -538,9 +542,9 @@ if __name__ == '__main__':
     v_friend = np.array(social_data['sid'], dtype=np.int32)
 
     n_train_users = np.ones(len(u_train))
-    train_r = scipy.sparse.csr_matrix((n_train_users, (u_train, i_train)), dtype=np.int16, shape=(num_users, num_items))
+    train_r = scipy.sparse.csr_matrix((n_train_users, (u_train, i_train)), dtype=np.int16, shape=(n_users, n_items))
     n_test_users = np.ones(len(u_test))
-    test_r = scipy.sparse.csr_matrix((n_test_users, (u_test, i_test)), dtype=np.int16, shape=(num_users, num_items))
+    test_r = scipy.sparse.csr_matrix((n_test_users, (u_test, i_test)), dtype=np.int16, shape=(n_users, n_items))
 
     test_set, train_set, train_f_set, train_q_set, max_questions, max_items, max_friends = \
         preprocess_data(u_train, u_test, i_train, i_test, u_friend, v_friend)
@@ -553,7 +557,7 @@ if __name__ == '__main__':
         session_conf.gpu_options.allow_growth = True
         sess = tf.Session(config=session_conf)
         with sess.as_default():
-            model = EATNN(num_users, num_items, max_questions, max_items, max_friends)
+            model = EATNN(n_users, n_items, max_questions, max_items, max_friends)
             model.build_graph()
 
             optimizer = tf.train.AdagradOptimizer(learning_rate=0.05, initial_accumulator_value=1e-8).minimize(
@@ -592,3 +596,4 @@ if __name__ == '__main__':
                       % (time.time() - start_t))
 
                 eval_step(test_set, train_r, test_r, batch_size)
+

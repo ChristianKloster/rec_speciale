@@ -1,236 +1,300 @@
-from typing import List, Tuple, Union, Dict
+import os
+from collections import defaultdict
 
-import numpy as np
-import pickle
-import utils
-import pandas as pd
-import evaluation.evaluation_v2 as eval
-#from loguru import logger
-from scipy.linalg import solve_sylvester, inv, LinAlgError
-from maxvol2 import py_rect_maxvol
 from tqdm import tqdm
+from scipy.linalg import solve_sylvester
+import scipy.sparse
+import matplotlib.pyplot as plt
+import numpy as np
+
+import evaluation.evaluation_v2 as eval2
+import sys
+import DivRank as dr
+import Tree
+import pandas as pd
+import utils
+import maxvol
+from maxvol2 import py_rect_maxvol
+from numpy.linalg import inv
+from numpy.linalg import norm
+import time
+import pickle
 
 
-
-
-
-LIKE = 5
-DISLIKE = 1
-
-
-def except_item(lst, item):
-    return [i for i in lst if not i == item]
-
-
-def group_representation(users: List[int],
-                         l1_questions: List[int], l2_questions: List[int],
-                         ratings: np.ndarray) -> np.ndarray:
-    ratings_submatrix = ratings[users][:, l1_questions + l2_questions]
-    with_bias = np.hstack((ratings_submatrix, np.ones((len(users), 1))))
-    return with_bias
-
-
-def split_users(users: List[int], entity: int, ratings: np.ndarray) -> Tuple[List[int], List[int]]:
-    user_ratings = ratings[users, entity]
-    likes, = np.where(user_ratings > 4)
-    dislikes, = np.where(user_ratings <= 4)
-    return likes, dislikes
-
-
-def global_questions_vector(questions: List[int], max_length: int) -> List[int]:
-    padding = [-1 for _ in range(max_length - len(questions))]
-    return questions + padding
-
-
-def local_questions_vector(candidates: List[int], entity_embeddings: np.ndarray, max_length: int) -> List[int]:
-    questions, _ = py_rect_maxvol(entity_embeddings[candidates], maxK=max_length)
+def local_questions_vector(candidates: list, entity_embeddings: np.ndarray, max_length: int):
+    questions, _ = py_rect_maxvol(entity_embeddings[list(candidates)], maxK=max_length)
     return questions[:max_length].tolist()
 
 
-def group_loss(users: List[int], global_questions: List[int], local_questions: List[int],
-               entity_embeddings: np.ndarray, ratings: np.ndarray) -> float:
-    _B = group_representation(users, global_questions, local_questions, ratings)
-    _T = transformation(users, _B, entity_embeddings, ratings)
+class LRMF():
+    def __init__(self, data: pd.DataFrame, num_global_questions: int,
+                 num_local_questions: int, use_saved_data = False, alpha: float = 0.01, beta: float = 0.01,
+                 embedding_size: int = 20, candidate_items: set = None, num_candidate_items: int = 200):
+        '''
+        Skriv lige noget om at vi bruger det her paper som kan findes her
+        '''
+        self.num_candidate_items = num_candidate_items
+        self.num_global_questions = num_global_questions
+        self.num_local_questions = num_local_questions
+        if use_saved_data:
+                self.train_data= pd.read_csv('LRMF_data/each_movie/each_movie_train.txt', sep=',')
+                self.test_data = pd.read_csv('LRMF_data/each_movie/each_movie_test.txt', sep=',')
+        else:
+            self.train_data, self.test_data = utils.train_test_split_user(data)
+            self.train_data.to_csv('LRMF_data/each_movie/each_movie_train.txt', sep=',', index=False)
+            self.test_data.to_csv('LRMF_data/each_movie/each_movie_test.txt', sep=',', index=False)
 
-    group_ratings = ratings[users]
-    predicted_ratings = _B @ _T @ entity_embeddings.T
-    loss = ((group_ratings - predicted_ratings) ** 2).sum()
-    regularisation = _T.sum() ** 2
+        self.inner_2raw_uid, self.raw_2inner_uid, self.inner_2raw_iid, self.raw_2inner_iid = utils.build_id_dicts(data)
 
-    return loss + regularisation
+        ###--- Notice ---###
+        ### Make sure the candidate items are produced recently or you produce them again when using this option.
+        self.train_data.iid = [self.raw_2inner_iid[iid] for iid in self.train_data.iid]
+        self.test_data.iid = [self.raw_2inner_iid[iid] for iid in self.test_data.iid]
+        ###--- Notice ---###
+
+        #self.R = utils.build_interaction_matrix(self.train_data, self.raw_2inner_uid, self.raw_2inner_iid)
+        #self.test_R = utils.build_interaction_matrix(self.test_data, self.raw_2inner_uid, self.raw_2inner_iid)
+
+        self.R = pd.pivot_table(self.train_data, values='rating', index='uid', columns='iid').fillna(0)
+        self.ratings = self.R.to_numpy()
+        self.test_R = pd.pivot_table(self.test_data, values='rating', index='uid', columns='iid').fillna(0)
+        self.test_ratings = self.test_R.to_numpy()
+        self.train_iids = list(self.R.columns)
+        self.test_iids = list(self.test_R.columns)
+
+        self.embedding_size = embedding_size
+        self.num_users, self.num_items = self.ratings.shape
+        self.num_test_users = self.test_ratings.shape[0]
+
+        self.V = np.random.rand(embedding_size, self.num_items)  # Item representations
+        self.alpha = alpha
+        self.beta = beta
+
+        if candidate_items is not None:
+            self.candidate_items = candidate_items
+        else:
+            self.candidate_items = self._find_candidate_items()
+            with open('LRMF_data/each_movie/eachmovie_candidates.txt', 'wb') as f:
+                pickle.dump(self.candidate_items, f)
+
+    def fit(self, tol: float = 0.01, maxiters: int = 5):
+
+        users = [u for u in range(self.num_users)]
+        best_tree = None
+        best_V = None
+        best_loss = sys.maxsize
+        best_ndcg = sys.maxsize
+        best_ten = None
+        best_fifty = None
+        best_hundred = None
+
+        ndcg_list = []
+        loss = []
+        for epoch in range(maxiters):
+            maxvol_representatives, _ = maxvol.maxvol(self.V.T)
+
+            tree = self._grow_tree(users, set(self.candidate_items), 0, maxvol_representatives, [])
+
+            self.V = self._learn_item_profiles(tree)
+
+            epoch_loss = self._compute_loss(tree)
+
+            loss.append(epoch_loss)
+            #ten, fifty, hundred = self.evaluate(tree)
+            ten = self.evaluate(tree)
+            print('bp')
+
+            if epoch_loss < best_loss:
+                best_epoch = epoch
+                best_loss = epoch_loss
+                best_tree = tree
+                best_ten = ten
+               # best_fifty = fifty
+               # best_hundred = hundred
+                best_V = self.V
+
+        self.tree = best_tree
+        self.V = best_V
+        self.best_ten = best_ten
+        self.best_fifty = best_fifty
+        self.best_hundred = best_hundred
+        self.store_model("LRMF_models/each_movie/each_movie_best_model.pkl")
+
+    def _find_candidate_items(self):
+        # building item-item colike network
+        # assumes that train_data.iid is inner_ids
+        colike_graph = utils.build_colike_network(self.train_data)
+        # computing divranks for each raw iid
+        divranks = dr.divrank(colike_graph)
+        # sorting raw iids based on their divrank score
+        sorted_candidate_items = sorted(divranks, key=lambda n: divranks[n], reverse=True)
+        # return the top num_candidate_items
+        return sorted_candidate_items[:self.num_candidate_items]
+
+    def _grow_tree(self, users, items: set, depth: int,
+                   maxvol_iids: list, global_representatives: list):
+        '''
+        :param users: list of uids
+        :param items: list of iids on candidate items
+        :param depth: depth of tree
+        :param global_representatives: items asked previously (defaults to None)
+        :return: Tree
+        '''
+        current_node = Tree.Node(users, None, None, None, None)
+        best_question, like, dislike = None, None, None
+
+        local_representatives = local_questions_vector(self.candidate_items, self.V.T, self.num_local_questions)
+        current_node.set_locals(local_representatives)  # set the best local questions to ask in this node
+        current_node.set_globals(global_representatives)  # set the global questions asked to get here
+
+        if depth == self.num_global_questions:
+            current_node.question = current_node.global_questions[-1:]
+            B = self._build_B(users, local_representatives, global_representatives)
+            current_node.set_transformation(self._solve_sylvester(B, users))
+
+        if depth < self.num_global_questions:
+            # computes loss with equation 11 for each candidate item
+            min_loss, best_question, best_locals = np.inf, None, []
+            for item in tqdm(self.candidate_items, desc=f'[Selecting question at depth {depth} ]'):
+                like, dislike = self._split_users(users, item)
+                loss = 0
+
+                # Some solutions uses a padding of -1 for the global questions here
+                for group in [like, dislike]:
+                    rest_candidates = [i for i in self.candidate_items if not i == item]
+                    local_questions = local_questions_vector(rest_candidates, self.V.T, self.num_local_questions)
+                    loss += self._group_loss(group, global_representatives, local_questions)
+
+                if loss < min_loss:
+                    min_loss = loss
+                    best_question = item
+                    best_locals = local_questions
+            if best_question is None:
+                print('Oh shit, this should not happen :(((')
 
 
-def transformation(users: List[int],
-                   representation: np.ndarray, entity_embeddings: np.ndarray,
-                   ratings: np.ndarray, alpha=1.0) -> np.ndarray:
-    try:
-        _A = representation.T @ representation
-        _B = alpha * inv(entity_embeddings.T @ entity_embeddings)
-        _Q = representation.T @ ratings[users] @ entity_embeddings @ inv(entity_embeddings.T @ entity_embeddings)
-        return solve_sylvester(_A, _B, _Q)
-    except LinAlgError as err:
-        return np.zeros((representation.shape[1], entity_embeddings.shape[1]))
+            # update a copy of global questions with the new best item
+            g_r = list(global_representatives).copy()
+            g_r.append(best_question)
+            current_node.question = best_question
+
+            # notice, if one of the splits have no users, we cant build a transformation matrix.
+            # therefore we don't split but still increase the amount of global questions asked.
+            U_like, U_dislike = self._split_users(users, best_question)
+            if not U_like or not U_dislike:
+                print('could not split')
+                print(current_node.question)
+                current_node.child = self._grow_tree(users, items - {best_question}, depth + 1, maxvol_iids, g_r)
+
+            else:
+                # overrides the local questions.
+                current_node.set_locals(best_locals)
+                # append the best question to the global questions asked so far
+
+                # calculate the transformation matrix
+                # B = self._build_B(users, best_locals, g_r)
+                # current_node.transformation = self._solve_sylvester(B, users)
+                print(current_node.question)
+                current_node.like = self._grow_tree(U_like, items - {best_question}, depth + 1, maxvol_iids,
+                                   g_r)
+                current_node.dislike = self._grow_tree(U_dislike, items - {best_question}, depth + 1, maxvol_iids,
+                                      g_r)
+        return current_node
+
+    def _group_loss(self, users, global_representatives, local_representatives):
+        B = self._build_B(users, local_representatives, global_representatives)
+        T = self._solve_sylvester(B, users)
+
+        Rg = self.ratings[users]
+        pred = B @ T @ self.V
+        loss = ((Rg - pred) ** 2).sum()
+        regularisation = T.sum() ** 2
+
+        return loss + regularisation
+
+    def _build_B(self, users, local_representatives, global_representatives):
+        # B = [U1, U2, e]
+        U1 = self.ratings[users, :][:, global_representatives]
+        U2 = self.ratings[users, :][:, local_representatives]
+        return np.hstack((U1, U2, np.ones(shape=(len(users), 1))))
+
+    def _solve_sylvester(self, B, users):
+        T = solve_sylvester(B.T @ B,
+                            self.alpha * inv(self.V @ self.V.T),
+                            B.T @ self.ratings[users] @ self.V.T @ inv(self.V @ self.V.T))
+
+        return T
+
+    def _split_users(self, users, iid):
+        if implicit:
+            like = [uid for uid in users if self.ratings[uid, iid] == 1]
+            dislike = list(set(users) - set(like))
+        else:
+            like = [uid for uid in users if self.ratings[uid, iid] >= 4] # inner uids of users who like inner iid
+            dislike = list(set(users) - set(like))  # inner iids of users who dislike inner iid
+
+        return like, dislike
+
+    def _learn_item_profiles(self, tree):
+        S = np.zeros(shape=(self.num_users, self.embedding_size))
+
+        for user in tqdm(range(self.num_users), desc="[Optimizing entity embeddings...]"):
+            leaf = Tree.traverse_a_user(user, self.ratings[user], tree)
+            B = self._build_B([user], leaf.local_questions, leaf.global_questions)
+
+            try:
+                S[user] = B @ leaf.transformation
+            except ValueError:
+                print('Arrhhh shit, here we go again')
+
+        return (inv(S.T @ S + self.beta * np.identity(self.embedding_size)) @ S.T @ self.R).to_numpy()
+
+    def _compute_loss(self, tree):
+        if tree.is_leaf():
+            B = self._build_B(tree.users, tree.local_questions, tree.global_questions)
+            pred = B @ tree.transformation @ self.V
+            Rg = self.ratings[tree.users]
+            return norm(Rg[Rg.nonzero()] - pred[Rg.nonzero()]) + self.alpha * norm(tree.transformation)
+
+        else:
+            if tree.child == None:
+                return self._compute_loss(tree.like) + self._compute_loss(tree.dislike)
+            else:
+                return self._compute_loss(tree.child)
 
 
-def optimise_entity_embeddings(ratings: np.ndarray, tree, k: int, kk: int, regularisation: float) -> np.ndarray:
-    n_users, n_entities = ratings.shape
-    _S = np.zeros((n_users, kk))
+    def evaluate(self, tree):
+        item_profiles = self.V.T
 
-    for u in tqdm(range(n_users), desc="[Optimizing entity embeddings...]"):
-        _S[u] = tree.interview_existing_user(u)
+        test_users = range(self.num_test_users)
+        user_profiles = pd.DataFrame(data=0, index=range(self.num_test_users), columns=range(20))
 
-    try:
-        _A = inv(_S.T @ _S) + np.eye(kk) * regularisation
-        _B = _S.T @ ratings
-        return (_A @ _B).T
-    except LinAlgError as err:
-        return np.zeros((n_entities, kk))
+        u_a_empty = []
+        for user in test_users:
+            user_profiles.iloc[user] = self.interview_new_user(self.test_ratings[user], u_a_empty, tree)
 
+        pred = user_profiles @ item_profiles.T
 
-class LRMF:
-    def __init__(self, n_users: int, n_entities: int, l1: int, l2: int, kk: int, regularisation: float):
-        """
-        Instantiates an LRMF model for conducting interviews and making
-        recommendations. The model conducts an interview of total length L = l1 + l2.
+        print(f'----- Computing metrics for k10')
+        m10 = eval2.Metrics2(np.array(pred), self.test_ratings, 10, 'ndcg,precision,recall').calculate()
+       # print(f'----- Computing metrics for k50')
+       # m50 = eval2.Metrics2(np.array(pred), self.test_ratings, 50, 'ndcg,precision,recall').calculate()
+       # print(f'----- Computing metrics for k100')
+       # m100 = eval2.Metrics2(np.array(pred), self.test_ratings, 100, 'ndcg,precision,recall').calculate()
 
-        :param n_users: The number of users.
-        :param n_entities: The number of entities.
-        :param l1: The number of global questions to be used for group division.
-        :param l2: The number of local questions to be asked in every group.
-        :param kk: The number of latent factors for entity embeddings.
-                   NOTE: Due to a seemingly self-imposed restriction from the paper, the number
-                   of latent factors used to represent entities must be exactly l2, and cannot be kk.
-                   We have emailed the authors requesting an explanation and are awaiting a response.
-        :param regularisation: Control parameter for l2-norm regularisation.
-        """
-        self.n_users = n_users
-        self.n_entities = n_entities
-        self.l1 = l1
-        self.l2 = l2
-        self.kk = kk  # See the note
-        self.regularisation = regularisation
+        return m10#, m50, m100
 
-        self.interview_length: int = self.l1 + self.l2
-        self.k: int = self.interview_length + 1
-
-        self.ratings: np.ndarray = np.zeros((self.n_users, self.n_entities))
-        self.entity_embeddings: np.ndarray = np.random.rand(self.n_entities, self.kk)
-
-        self.T = Tree(l1_questions=[], depth=0, max_depth=self.l1, lrmf=self)
-
-    def fit(self, ratings: np.ndarray, candidates: List[int]):
-        self.ratings = ratings
-
-        all_users = [u for u in range(self.n_users)]
-
-        self.T.grow(all_users, candidates)
-        self.entity_embeddings = optimise_entity_embeddings(ratings, self.T, self.k, self.kk, self.regularisation)
-
-    def validate(self, user: int, to_validate: List[int]) -> Dict[int, float]:
-        user_vector = self.T.interview_existing_user(user)
-        similarities = user_vector @ self.entity_embeddings[to_validate].T
-        return {e: s for e, s in zip(to_validate, similarities)}
-
-    def interview(self, answers: Dict[int, int]) -> int:
-        return self.T.interview_new_user(answers, {})
-
-    def rank(self, items: List[int], answers: Dict[int, int]):
-        user_vector = self.T.interview_new_user(answers, {})
-        similarities = user_vector @ self.entity_embeddings[items].T
-        return {e: s for e, s in zip(items, similarities)}
-
-    def _val(self, users):
-        predictions = []
-        for u_idx, user in users.items():
-            prediction = self.validate(u_idx, user.validation.to_list())
-            predictions.append((user.validation, prediction))
-
-
-class Tree:
-    def __init__(self, l1_questions: List[int], depth: int, max_depth: int, lrmf: LRMF):
-        self.depth = depth
-        self.max_depth = max_depth
-        self.l1_questions = l1_questions
-        self.l2_questions: List[int] = []
-        self.lrmf = lrmf
-
-        self.users: List[int] = []
-        self.transformation: Union[np.ndarray, None] = None
-
-        self.question: Union[int, None] = None
-
-        self.children: Union[Dict[int, Tree], None] = None
-
-    def is_leaf(self):
-        return self.depth == self.max_depth
-
-    def grow(self, users: List[int], candidates: List[int]):
-        self.users = users
-        self.l2_questions = local_questions_vector(
-            list(candidates), self.lrmf.entity_embeddings, self.lrmf.l2)
-
-        if self.is_leaf():
-            self.transformation = transformation(
-                self.users, group_representation(self.users, self.l1_questions, self.l2_questions, self.lrmf.ratings),
-                self.lrmf.entity_embeddings, self.lrmf.ratings)
-            return
-
-        min_loss, best_question = np.inf, None
-        for candidate in tqdm(candidates, desc=f'[Selecting question at depth {self.depth} ]'):
-            likes, dislikes = split_users(users, candidate, self.lrmf.ratings)
-
-            loss = 0
-            for group in [likes, dislikes]:
-                rest_candidates = except_item(candidates, candidate)
-                global_questions = global_questions_vector(self.l1_questions, self.lrmf.l1)
-                local_questions = local_questions_vector(rest_candidates, self.lrmf.entity_embeddings, self.lrmf.l2)
-                loss += group_loss(
-                    group, global_questions, local_questions, self.lrmf.entity_embeddings, self.lrmf.ratings)
-
-            if loss < min_loss:
-                min_loss = loss
-                best_question = candidate
-
-        self.question = best_question
-        remaining_candidates = except_item(candidates, self.question)
-        self.l2_questions = local_questions_vector(
-            remaining_candidates, self.lrmf.entity_embeddings, self.lrmf.l2)
-
-        self.transformation = transformation(
-            self.users, group_representation(self.users, self.l1_questions, self.l2_questions, self.lrmf.ratings),
-            self.lrmf.entity_embeddings, self.lrmf.ratings)
-
-        self.children = {
-            LIKE: Tree(self.l1_questions + [self.question], self.depth + 1, self.max_depth, self.lrmf),
-            DISLIKE: Tree(self.l1_questions + [self.question], self.depth + 1, self.max_depth, self.lrmf)
-        }
-
-        likes, dislikes = split_users(self.users, self.question, self.lrmf.ratings)
-        self.children[LIKE].grow(likes, remaining_candidates)
-        self.children[DISLIKE].grow(dislikes, remaining_candidates)
-
-    def interview_existing_user(self, user: int) -> np.ndarray:
-        if self.is_leaf():
-            user_vector, = group_representation([user], self.l1_questions, self.l2_questions, self.lrmf.ratings)
-            return user_vector @ self.transformation
-
-        answer = self.lrmf.ratings[user, self.question]
-        if answer < 5:
-            return self.children[1].interview_existing_user(user)
-        elif answer <= 6:
-            return self.children[5].interview_existing_user(user)
-
-    def interview_new_user(self, actual_answers, user_answers) -> Union[int, np.ndarray]:
-        if self.is_leaf():
+    def interview_new_user(self, actual_answers, user_answers, tree):
+        if tree.is_leaf():
             # Have we asked all our local questions?
-            if len(user_answers) < self.lrmf.interview_length:
-                for local_question in self.l2_questions:
+            if len(user_answers) < len(tree.global_questions) + len(tree.local_questions):
+                for local_question in tree.local_questions:
                     # First try to exhaust the available answers
                     try:
                         answer = actual_answers[local_question]
                         u_a = user_answers.copy()
                         u_a.append(answer)
-                        return self.interview_new_user(actual_answers, u_a)
+                        return self.interview_new_user(actual_answers, u_a, tree)
 
                     # If we cannot get an answer from the arguments, return the question
                     except IndexError:
@@ -240,101 +304,184 @@ class Tree:
             else:
                 user_vector = [a for a in user_answers]
                 user_vector.append(1)  # Add bias
-                return user_vector @ self.transformation
-
-#        if not actual_answers:
-#            return self.question
+                return np.array(user_vector) @ tree.transformation
 
         # find answer to global question
-        answer = actual_answers[self.question]
+        try:
+            answer = actual_answers[tree.question]
+        except IndexError:
+            print(f'item {tree.question} was not found in test, setting answer to 0')
+            answer = 0
 
         u_a = user_answers.copy()
         u_a.append(answer)
-        if answer >= 4:
-            return self.children[5].interview_new_user(actual_answers, u_a)
-        if answer < 4:
-            return self.children[1].interview_new_user(actual_answers, u_a)
 
-class LRMFMain():
-    def __init__(self, data, candidates):
-        self.candidates = candidates
-        self.data = data
+        if implicit:
+            if tree.child == None:
+                if answer == 1:
+                    return self.interview_new_user(actual_answers, u_a, tree.like)
+                if answer == 0:
+                    return self.interview_new_user(actual_answers, u_a, tree.dislike)
+            else:
+                return self.interview_new_user(actual_answers, u_a, tree.child)
 
-        self.n_users = self.data.shape[0]
-        self.n_entities = self.data.shape[1]
+        else:
+            if tree.child == None:
+                if answer >= 3:
+                    return self.interview_new_user(actual_answers, u_a, tree.like)
+                if answer < 3:
+                    return self.interview_new_user(actual_answers, u_a, tree.dislike)
+            else:
+                return self.interview_new_user(actual_answers, u_a, tree.child)
 
-    def interview(self, l1, l2):
-        self.model = LRMF(n_users=self.n_users, n_entities=self.n_entities,
-                              l1=l1, l2=l2, kk=20, regularisation=0.01)  # See notes
-        self._fit()
+    def store_model(self, file):
+        DATA_ROOT = ''
+        with open(os.path.join(DATA_ROOT, file), 'wb') as f:
+            pickle.dump(self, f)
 
 
-    def _fit(self, iterations=5):
-#        for iteration in tqdm(range(0, iterations), desc=f'[Training LRMF]'):
-#            self.model.fit(self.data, self.candidates)
-#            tree = self.model.T
-#           items = self.model.entity_embeddings
 
-#            with open(f'models/tree_each_movie_loan_{iteration}.txt', 'wb') as f:
-#                pickle.dump(tree, f)
-#            with open(f'models/items_each_movie_loan_{iteration}.txt', 'wb') as f:
-#               pickle.dump(items, f)
+def test_tree(users, items, depth):
+    like, dislike, best_item = None, None, None
 
-        with open(f'models/tree_each_movie_loan_{3}.txt', 'rb') as f:
-            tree = pickle.load(f)
-        with open(f'models/items_each_movie_loan_{3}.txt', 'rb') as f:
-            items = pickle.load(f)
+    if depth < 2 or not users:
+        best_item = min(items)
+        if 3 in users:
+            best_item = 3
+        split_idx = round(len(users) / 2)
 
-            # finds items in training that are not in test
-        not_in_test = np.setdiff1d(train_iids, test_iids)
+        U_like = users[:split_idx]
+        U_dislike = users[split_idx:]
 
-            # removes the items only in training based on their index in the train_iid list.
-        for element in not_in_test:
-            np.delete(items, train_iids.index(element), axis=0)
+        like = test_tree(U_like, items - {best_item}, depth + 1)
+        dislike = test_tree(U_dislike, items - {best_item}, depth + 1)
 
-        test_users = range(test_data.shape[0])
-        user_profiles = pd.DataFrame(data=0, index=test_users, columns=range(20))
-
-        u_a_empty = []
-
-        for user in test_users:
-            user_profiles.iloc[user] = tree.interview_new_user(test_data[user], u_a_empty)
-
-        reconstructed_ratings = user_profiles @ items.T
-
-        m = eval.Metrics2(reconstructed_ratings.to_numpy(), test_data, 10, 'precision').calculate()
-
-        print('test')
+    return Tree.Node(users, best_item, like, dislike)
 
 
 if __name__ == '__main__':
-#    data = utils.load_data('eachmovie_triple').astype('int')
-#    data.columns = ['iid', 'uid', 'count']
-    #train_data, test_data = utils.train_test_split_user(data)
 
-    #train_data.to_csv('data/each_movie_train_30_70.csv', sep=',', index=False)
-    #test_data.to_csv('data/each_movie_test_30_70.csv', sep=',', index=False)
+    #data = pd.read_csv('LRMF_data/each_movie/eachmovie_triple', sep='\s+', names=['iid', 'uid', 'rating'])
 
-    train_data = pd.read_csv('data/each_movie_train_30_70.csv', sep=',')
-    train_data = train_data.drop(train_data.columns[0], axis=1)
-    test_data = pd.read_csv('data/each_movie_test_30_70.csv', sep=',')
-    test_data = test_data.drop(test_data.columns[0], axis=1)
+    data = pd.read_csv('../LRMF/ciao/ratings.csv')
 
-    train_data = pd.pivot_table(train_data, values='count', index='uid', columns='iid').fillna(0)
-    test_data = pd.pivot_table(test_data, values='count', index='uid', columns='iid').fillna(0)
+    trust = pd.read_csv('../LRMF/LRMF_data/ciao_explicit/new_trust.csv')
 
-    train_iids = list(train_data.columns)
-    test_iids = list(test_data.columns)
+    inner_uids = list(range(data.uid.unique().shape[0]))
+    raw_uids = sorted(list(data.uid.unique()))
+    raw_2_inner_uid = dict(zip(raw_uids, inner_uids))
 
-    train_uids = list(train_data.index)
-    test_uids = list(test_data.index)
+    #data.uid = [raw_2_inner_uid[uid] for uid in data.uid]
 
-    train_data = train_data.to_numpy().astype('int')
-    test_data = test_data.to_numpy().astype('int')
+    trust.uid = [raw_2_inner_uid[uid] for uid in trust.uid]
+    trust.sid = [raw_2_inner_uid[uid] for uid in trust.sid]
+    trust.to_csv('LRMF_data/ciao_explicit/trust_extreme.csv', index=False)
 
-    with open(f'data/candidate_items_eachmovie.txt', 'rb') as f:
-        candidate_set = pickle.load(f)
 
-    lrmf = LRMFMain(train_data, candidate_set)
-    lrmf.interview(3, 2)
-    print('Heeej')
+    """
+    raw_iids = sorted(list(data.iid.unique()))
+    inner_iids = list(range(data.iid.unique().shape[0]))
+    raw_2_inner_iid = dict(zip(raw_iids, inner_iids))
+
+    data.iid = [raw_2_inner_iid[iid] for iid in data.iid]
+
+    train_data, test_data = utils.train_test_split(data)
+
+    train_data = train_data.astype(int)
+    test_data = test_data.astype(int)
+
+    train_iids = train_data.iid.unique()
+    test_iids = test_data.iid.unique()
+    test_item_not_in_train = list(np.setdiff1d(train_iids, test_iids))
+
+    test_data = test_data[~test_data.iid.isin(test_item_not_in_train)]
+    print('bp')
+    
+    train_data.to_csv('LRMF_data/ciao_implicit/training_ciao_implicit_25_75.csv', index=False)
+    test_data.to_csv('LRMF_data/ciao_implicit/testing_ciao_implicit_25_75.csv', index=False)
+    #trust.to_csv('LRMF_data/each_movie/socials_updated_ids.csv', index=False)
+
+    train_data = pd.read_csv('LRMF_data/each_movie/training_each_movie_25_75.csv')
+    test_data = pd.read_csv('LRMF_data/each_movie/testing_each_movie_25_75.csv')
+
+    train_iids = train_data.iid.unique()
+    test_iids = test_data.iid.unique()
+
+    raw_iids = sorted(list(train_iids))
+    inner_iids = list(range(train_iids.shape[0]))
+    raw_2_inner_iid = dict(zip(raw_iids, inner_iids))
+
+    train_data.iid = [raw_2_inner_iid[iid] for iid in train_data.iid]
+    test_data.iid = [raw_2_inner_iid[iid] for iid in test_data.iid]
+
+    train_data.to_csv('LRMF_data/each_movie/training_updated_each_movie_25_75.csv', index=False)
+    test_data.to_csv('LRMF_data/each_movie/testing_updated_each_movie_25_75.csv', index=False)
+  
+
+
+    train_data = pd.read_csv('LRMF_data/ciao_explicit/training_data_ciao_explicit_25_75.csv')
+    test_data = pd.read_csv('LRMF_data/ciao_explicit/testing_data_ciao_explicit_25_75.csv')
+
+    occurences = train_data.uid.value_counts()
+    occurences_2 = occurences.value_counts().sort_index()
+
+    indexes = [index for index in occurences_2.index.values.tolist() if index > 10]
+
+    extreme_users = np.setdiff1d(test_data.uid.unique(), train_data.uid.unique()).size
+    ten_plus = 0
+    for index in indexes:
+        ten_plus += occurences_2.loc[index]
+
+    top_ten = occurences_2[:11]
+    top_ten.loc[11] = ten_plus
+
+    names = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '10+']
+
+    top_ten = pd.concat([pd.Series([extreme_users]), top_ten])
+
+
+    plot = top_ten.plot(kind='bar')
+    plot.set_xticklabels(names)
+    plot.set_title('Ciao Explicit   EachMovie', size='24')
+    plt.xlabel('Interactions', size='20')
+    plt.ylabel('Users', size='20')
+    #plt.ylim((0, 22500))
+
+    plt.show()
+    print('bp')
+
+    print('hvad fanden??')
+    """
+
+    """
+    trust = pd.read_csv('LRMF_data/ciao_explicit/raw_trust_with_removed_friendsships.csv')
+
+    inner_uids = list(range(data.uid.unique().shape[0]))
+    raw_uids = sorted(list(data.uid.unique()))
+    raw_2_inner_uid = dict(zip(raw_uids, inner_uids))
+
+    data.uid = [raw_2_inner_uid[uid] for uid in data.uid]
+
+    trust.uid = [raw_2_inner_uid[uid] for uid in trust.uid]
+    trust.sid = [raw_2_inner_uid[uid] for uid in trust.sid]
+    trust.to_csv('LRMF_data/ciao_explicit/raw_trust_with_removed_friendships_updated_ids.csv', index=False)
+
+    raw_iids = sorted(list(data.iid.unique()))
+    inner_iids = list(range(data.iid.unique().shape[0]))
+    raw_2_inner_iid = dict(zip(raw_iids, inner_iids))
+
+    data.iid = [raw_2_inner_iid[iid] for iid in data.iid]
+
+    train_data, test_data = utils.train_test_split(data)
+
+    train_data = train_data.astype(int)
+    test_data = test_data.astype(int)
+
+    train_iids = train_data.iid.unique()
+    test_iids = test_data.iid.unique()
+    test_item_not_in_train = list(np.setdiff1d(train_iids, test_iids))
+
+    if len(test_item_not_in_train) == 0:
+        train_data.to_csv('LRMF_data/ciao_explicit/training_data_ciao_explicit_25_75.csv', index=False)
+        test_data.to_csv('LRMF_data/ciao_explicit/testing_data_ciao_explicit_25_75.csv', index=False)
+    """
